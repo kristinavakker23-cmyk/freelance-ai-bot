@@ -1,8 +1,9 @@
 """
-Freelance AI Bot v2 — полноценная система автопоиска и автооткликов.
+Freelance AI Bot v3 — полноценная система автопоиска и автооткликов с Playwright.
 - Парсинг: Fl.ru, Freelancer.com, GitHub
 - LLM-категоризация: изображения, видео, сценарии, разработка и тд
 - Автоотклик: первые 3 на проверку, потом автомат
+- Playwright: реальная отправка откликов на платформы
 - Трекинг аккаунта: отклики, ответы, рейтинг
 """
 import os, re, sys, time, json, logging, requests, threading
@@ -10,6 +11,15 @@ from datetime import datetime
 from flask import Flask, request as flask_request
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+
+# Playwright (optional — may not be installed)
+try:
+    from browser import browser_manager, submit_application, cookies_valid, SUBMITTERS
+    HAS_PLAYWRIGHT = True
+except ImportError:
+    HAS_PLAYWRIGHT = False
+    log = logging.getLogger("freelance")
+    log.warning("Playwright not available — browser automation disabled")
 
 load_dotenv()
 
@@ -493,10 +503,33 @@ def auto_apply_task(task, cid):
         log.info(f"Отклик на согласование: {task['title'][:40]}")
         return
 
-    # После 3 — автоматически
+    # После 3 — автоматически (с Playwright если доступен)
     if AUTO_APPLY:
         log.info(f"Автоотклик: {task['title'][:40]}")
-        add_application(task["platform"], task["url"], response)
+
+        # Пытаемся отправить через Playwright
+        if HAS_PLAYWRIGHT:
+            try:
+                from browser import browser_manager, submit_application, cookies_valid
+                if cookies_valid(task["platform"]):
+                    result = browser_manager.run_async(
+                        submit_application(task["platform"], task["url"], response)
+                    )
+                    if result.get("success"):
+                        add_application(task["platform"], task["url"], response)
+                        log.info(f"Playwright: отклик отправлен на {task['platform']}")
+                    else:
+                        log.warning(f"Playwright: {result.get('message', 'ошибка')}")
+                        # Fallback: just record it
+                        add_application(task["platform"], task["url"], response)
+                else:
+                    log.info(f"Нет cookies для {task['platform']}, записываю отклик без отправки")
+                    add_application(task["platform"], task["url"], response)
+            except Exception as e:
+                log.error(f"Playwright auto-apply error: {e}")
+                add_application(task["platform"], task["url"], response)
+        else:
+            add_application(task["platform"], task["url"], response)
 
         # Помечаем задачу
         tasks = load_tasks()
@@ -546,16 +579,21 @@ def handle_command(cid, text, user):
     log.info(f"Command {cmd} from chat={cid}")
 
     if cmd == "/start":
+        pw_status = "✅ Playwright" if HAS_PLAYWRIGHT else "❌ Playwright"
         answer(cid,
-            "<b>Freelance AI Bot v2</b>\n\n"
+            "<b>Freelance AI Bot v3</b>\n\n"
             "Авто-поиск и автоотклик на AI/ML задачи.\n\n"
-            "<b>Биржи:</b> Fl.ru, Freelancer.com, GitHub\n\n"
+            "<b>Биржи:</b> Fl.ru, Freelancer.com, GitHub\n"
+            f"<b>Браузер:</b> {pw_status}\n\n"
             "<b>Команды:</b>\n"
             "/parse — поиск задач\n"
             "/tasks — задачи\n"
             "/tasks images — задачи по категории\n"
             "/analyze 3 — AI-анализ\n"
             "/respond 3 — отклик\n"
+            "/submit 3 — отправить отклик через браузер\n"
+            "/login flru — авторизация на платформе\n"
+            "/cookies — статус cookies\n"
             "/approve_0 — одобрить отклик\n"
             "/reject_0 — отклонить отклик\n"
             "/auto — вкл/выкл автоотклик\n"
@@ -564,6 +602,14 @@ def handle_command(cid, text, user):
             "/help — справка")
 
     elif cmd == "/help":
+        pw_cmds = ""
+        if HAS_PLAYWRIGHT:
+            pw_cmds = (
+                "/submit 3 — отправить отклик #3 через браузер\n"
+                "/login flru — авторизация на Fl.ru\n"
+                "/login freelancer — авторизация на Freelancer\n"
+                "/cookies — статус cookies по платформам\n\n"
+            )
         answer(cid,
             "<b>Справка:</b>\n\n"
             "/parse — парсинг всех бирж\n"
@@ -572,6 +618,7 @@ def handle_command(cid, text, user):
             "/tasks development — только разработка\n"
             "/analyze 3 — AI-анализ задачи #3\n"
             "/respond 3 — сгенерировать отклик\n"
+            f"{pw_cmds}"
             "/approve_0 — одобрить отклик #0\n"
             "/reject_0 — отклонить отклик #0\n"
             "/auto — автоотклик вкл/выкл\n"
@@ -726,6 +773,134 @@ def handle_command(cid, text, user):
         save_stats(stats)
         answer(cid, f"Отклик отклонён: {item['task_title'][:50]}")
 
+    # === Playwright-команды ===
+
+    elif cmd == "/submit":
+        if not HAS_PLAYWRIGHT:
+            answer(cid, "❌ Playwright не установлен. Установи: pip install playwright && playwright install chromium")
+            return
+        if not args:
+            answer(cid, "Использование: /submit 3\n(отправить отклик на задачу #3)")
+            return
+        try: num = int(args[0])
+        except: answer(cid, "Укажи номер задачи: /submit 3"); return
+        tasks = load_tasks()
+        new_tasks = [t for t in tasks if t.get("status") in ("new", "analyzed")]
+        if num < 1 or num > len(new_tasks):
+            answer(cid, f"Задача #{num} не найдена. Доступно: 1-{len(new_tasks)}")
+            return
+        task = new_tasks[num - 1]
+        platform = task.get("platform", "")
+        if platform not in SUBMITTERS:
+            answer(cid, f"Автоотправка не поддерживается для {platform}")
+            return
+
+        # Check cookies
+        if not cookies_valid(platform):
+            answer(cid, f"⚠️ Нет cookies для {platform}. Сначала авторизуйся: /login {platform}")
+            return
+
+        # Generate response if not exists
+        response = task.get("ai_response")
+        if not response:
+            answer(cid, "Генерирую отклик...")
+            response = generate_response(task)
+            if not response:
+                answer(cid, "LLM недоступен.")
+                return
+            # Save response
+            tasks = load_tasks()
+            for t in tasks:
+                if t["url"] == task["url"]:
+                    t["ai_response"] = response
+                    break
+            save_tasks(tasks)
+
+        answer(cid, f"🌐 Отправляю отклик на {platform}...")
+        try:
+            from browser import browser_manager, submit_application
+            result = browser_manager.run_async(
+                submit_application(platform, task["url"], response)
+            )
+            if result.get("success"):
+                # Mark as applied
+                tasks = load_tasks()
+                for t in tasks:
+                    if t["url"] == task["url"]:
+                        t["applied"] = True
+                        t["status"] = "applied"
+                        break
+                save_tasks(tasks)
+                add_application(platform, task["url"], response)
+                answer(cid, f"✅ {result['message']}\n\n<a href=\"{task['url']}\">Открыть задачу</a>")
+            else:
+                answer(cid, f"❌ {result.get('message', 'Ошибка')}")
+        except Exception as e:
+            log.error(f"Submit error: {e}", exc_info=True)
+            answer(cid, f"Ошибка: {e}")
+
+    elif cmd == "/login":
+        if not HAS_PLAYWRIGHT:
+            answer(cid, "❌ Playwright не установлен.")
+            return
+        if not args:
+            answer(cid,
+                "Использование: /login flru\n\n"
+                "Доступные платформы:\n"
+                "- flru (Fl.ru)\n"
+                "- freelancer (Freelancer.com)\n"
+                "- kwork (Kwork.ru)\n"
+                "- github (GitHub)")
+            return
+        platform = args[0].lower()
+        if platform not in SUBMITTERS:
+            answer(cid, f"Платформа {platform} не поддерживается.\nДоступные: flru, freelancer, kwork, github")
+            return
+
+        answer(cid, f"🔐 Открываю {platform} для авторизации...")
+        try:
+            from browser import browser_manager, SUBMITTERS, save_cookies
+            submitter = SUBMITTERS[platform]
+
+            async def do_login():
+                if not browser_manager.browser:
+                    await browser_manager.start()
+                ctx = await browser_manager.new_context(platform)
+                page = await ctx.new_page()
+                url = await submitter.login_page_url()
+                await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                await page.wait_for_timeout(3000)
+                # Check if already logged in
+                if await submitter.is_logged_in(page):
+                    await browser_manager.save_context_cookies(ctx, platform)
+                    await ctx.close()
+                    return {"success": True, "message": f"✅ Уже авторизован на {platform}! Cookies сохранены."}
+                else:
+                    await ctx.close()
+                    return {"success": False, "message": f"Нужно войти в аккаунт на {platform}. Открой веб-версию и залогинься."}
+
+            result = browser_manager.run_async(do_login())
+            answer(cid, result["message"])
+        except Exception as e:
+            log.error(f"Login error: {e}", exc_info=True)
+            answer(cid, f"Ошибка: {e}")
+
+    elif cmd == "/cookies":
+        if not HAS_PLAYWRIGHT:
+            answer(cid, "❌ Playwright не установлен.")
+            return
+        from browser import cookies_valid, load_cookies
+        lines = ["<b>Статус cookies:</b>\n"]
+        for platform in ["flru", "freelancer", "kwork", "github"]:
+            cookies = load_cookies(platform)
+            valid = cookies_valid(platform)
+            if cookies:
+                status = "✅" if valid else "⏰ просрочены"
+                lines.append(f"  {platform}: {status} ({len(cookies)} cookies)")
+            else:
+                lines.append(f"  {platform}: ❌ нет cookies")
+        answer(cid, "\n".join(lines))
+
     elif cmd == "/auto":
         global AUTO_APPLY
         AUTO_APPLY = not AUTO_APPLY
@@ -802,7 +977,7 @@ app = Flask(__name__)
 
 @app.route("/")
 def index():
-    return "Freelance AI Bot v2 is running!", 200
+    return "Freelance AI Bot v3 is running!", 200
 
 @app.route("/health")
 def health():
@@ -828,9 +1003,20 @@ def webhook():
 # === Main ===
 
 def main():
-    log.info("Starting Freelance AI Bot v2...")
+    log.info("Starting Freelance AI Bot v3...")
     if not BOT_TOKEN:
         log.error("TELEGRAM_TOKEN not set!"); return
+
+    # Start Playwright browser if available
+    if HAS_PLAYWRIGHT:
+        try:
+            from browser import browser_manager
+            import asyncio
+            loop = asyncio.new_event_loop()
+            loop.run_until_complete(browser_manager.start())
+            log.info("Playwright browser started")
+        except Exception as e:
+            log.warning(f"Playwright startup failed: {e}")
 
     webhook_url = RENDER_EXTERNAL_URL
     if webhook_url:
@@ -844,6 +1030,9 @@ def main():
         {"command": "tasks", "description": "Показать задачи"},
         {"command": "analyze", "description": "AI-анализ задачи"},
         {"command": "respond", "description": "Сгенерировать отклик"},
+        {"command": "submit", "description": "Отправить отклик через браузер"},
+        {"command": "login", "description": "Авторизация на платформе"},
+        {"command": "cookies", "description": "Статус cookies"},
         {"command": "auto", "description": "Автоотклик вкл/выкл"},
         {"command": "stats", "description": "Статистика"},
         {"command": "accounts", "description": "Аккаунты"},
@@ -851,7 +1040,7 @@ def main():
     ])
 
     threading.Thread(target=scheduler, daemon=True).start()
-    log.info(f"Автопарсинг каждые {PARSING_INTERVAL} мин | Автоотклик: {AUTO_APPLY}")
+    log.info(f"Автопарсинг каждые {PARSING_INTERVAL} мин | Автоотклик: {AUTO_APPLY} | Playwright: {HAS_PLAYWRIGHT}")
 
     log.info(f"Server on {PORT}...")
     app.run(host="0.0.0.0", port=PORT, debug=False)
