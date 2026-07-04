@@ -6,7 +6,7 @@ Freelance AI Bot v3 — полноценная система автопоиск
 - Playwright: реальная отправка откликов на платформы
 - Трекинг аккаунта: отклики, ответы, рейтинг
 """
-import os, re, sys, time, json, logging, requests, threading
+import os, re, sys, time, json, logging, requests, threading, asyncio
 from datetime import datetime
 from flask import Flask, request as flask_request
 from bs4 import BeautifulSoup
@@ -1011,12 +1011,18 @@ def main():
     if HAS_PLAYWRIGHT:
         try:
             from browser import browser_manager
-            import asyncio
-            loop = asyncio.new_event_loop()
-            loop.run_until_complete(browser_manager.start())
-            log.info("Playwright browser started")
+            # Run in a separate thread to avoid event loop conflicts
+            def _start_browser():
+                try:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    loop.run_until_complete(browser_manager.start())
+                    log.info("Playwright browser started")
+                except Exception as e:
+                    log.warning(f"Playwright startup failed: {e}")
+            threading.Thread(target=_start_browser, daemon=True).start()
         except Exception as e:
-            log.warning(f"Playwright startup failed: {e}")
+            log.warning(f"Playwright import error: {e}")
 
     webhook_url = RENDER_EXTERNAL_URL
     if webhook_url:
