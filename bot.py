@@ -153,7 +153,7 @@ def add_task(task):
     urls = {t["url"] for t in tasks}
     if task["url"] in urls:
         return False
-    task["found_at"] = datetime.utcnow().isoformat()
+    task["found_at"] = datetime.now().isoformat()
     task["ai_score"] = None
     task["ai_analysis"] = None
     task["ai_response"] = None
@@ -557,9 +557,14 @@ def main():
     if not BOT_TOKEN:
         log.error("TELEGRAM_TOKEN not set!"); return
 
-    if RENDER_EXTERNAL_URL:
-        r = api_call("setWebhook", url=f"{RENDER_EXTERNAL_URL}/webhook")
-        log.info(f"Webhook: {r}")
+    # Webhook: используем RENDER_EXTERNAL_URL или пробуем определить автоматически
+    webhook_url = RENDER_EXTERNAL_URL
+    if not webhook_url:
+        # На Render этот переменная должна быть, но на всякий случай
+        log.warning("RENDER_EXTERNAL_URL не задан, webhook не будет настроен")
+    else:
+        r = api_call("setWebhook", url=f"{webhook_url}/webhook")
+        log.info(f"Webhook set: {r}")
 
     api_call("setMyCommands", commands=[
         {"command": "parse", "description": "Поиск AI-задач"},
