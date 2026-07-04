@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.env
+data/
+chat_ids.txt
+*.log
+.vscode/
+.idea/
