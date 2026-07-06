@@ -221,6 +221,38 @@ images, video, scripts, development, ai_ml, voice, data, marketing
             return result
     return "development"  # По умолчанию
 
+# === Оценка сложности задачи ===
+
+def assess_complexity(title, description="", category=""):
+    """LLM оценивает сложность: что может сделать сама нейросеть, что нужно дополнительно."""
+    system = """Ты — оценщик задач для AI-ассистента. Определи сложность задачи и что нужно для её реализации.
+
+Ответь СТРОГО в JSON без markdown:
+{
+  "difficulty": "easy|medium|hard",
+  "can_do": "что может сделать сам AI (конкретно)",
+  "needs_extra": "что нужно дополнительно (инструменты, сервисы, человек)",
+  "estimated_time": "оценка времени",
+  "tools": ["список нужных инструментов/моделей"]
+}
+
+Критерии:
+- easy: генерация текста, изображений, простые скрипты — AI может сделать сам
+- medium: нужна интеграция с API, парсинг, анализ данных — AI может с инструментами
+- hard: нужна разработка приложения, база данных, сложная архитектура — нужен человек/доп. нейросети
+
+Без markdown-обёрток, только JSON."""
+
+    user = f"Задача: {title}\nОписание: {description[:1500]}\nКатегория: {category}"
+    result = llm_call(system, user, max_tokens=400)
+    if result:
+        try:
+            clean = re.sub(r"```json\n?|\n?```", "", result).strip()
+            return json.loads(clean)
+        except:
+            pass
+    return None
+
 # === AI-фильтр ===
 
 AI_KEYWORDS = [
@@ -277,6 +309,7 @@ def add_task(task):
     task["ai_score"] = None
     task["ai_analysis"] = None
     task["ai_response"] = None
+    task["ai_complexity"] = None  # LLM-оценка сложности
     task["status"] = "new"
     task["applied"] = False
     tasks.append(task)
@@ -441,6 +474,24 @@ def parse_all():
             if is_ai_task(proj.get("title", ""), proj.get("description", "")):
                 if add_task(proj):
                     new_count += 1
+                    # Оцениваем сложность для новой задачи
+                    try:
+                        cat = proj.get("category", "development")
+                        complexity = assess_complexity(
+                            proj.get("title", ""),
+                            proj.get("description", ""),
+                            cat
+                        )
+                        if complexity:
+                            tasks = load_tasks()
+                            for t in tasks:
+                                if t["url"] == proj["url"]:
+                                    t["ai_complexity"] = complexity
+                                    break
+                            save_tasks(tasks)
+                            proj["ai_complexity"] = complexity
+                    except Exception as e:
+                        log.warning(f"Complexity assess error: {e}")
                     ai_tasks.append(proj)
     log.info(f"Парсинг: {len(all_projects)} всего, {new_count} новых AI-задач")
     return ai_tasks
@@ -474,6 +525,19 @@ def auto_apply_task(task, cid):
         log.error(f"Не удалось сгенерировать отклик: {task['title'][:50]}")
         return
 
+    # === Изображения (easy) — сразу отправляем без согласования ===
+    is_images_easy = (
+        task.get("category") == "images"
+        and task.get("ai_complexity", {}).get("difficulty") == "easy"
+    )
+
+    if is_images_easy:
+        log.info(f"🎨 Автоотправка изображений (easy): {task['title'][:40]}")
+        _do_send(task, response, cid)
+        return
+
+    # === Остальные категории — на согласование (первые 3), потом автомат ===
+
     # Первые 3 — на согласование
     if len(pending) < 3:
         pending.append({
@@ -503,55 +567,60 @@ def auto_apply_task(task, cid):
         log.info(f"Отклик на согласование: {task['title'][:40]}")
         return
 
-    # После 3 — автоматически (с Playwright если доступен)
+    # После 3 — автоматически
     if AUTO_APPLY:
-        log.info(f"Автоотклик: {task['title'][:40]}")
+        _do_send(task, response, cid)
 
-        # Пытаемся отправить через Playwright
-        if HAS_PLAYWRIGHT:
-            try:
-                from browser import browser_manager, submit_application, cookies_valid
-                if cookies_valid(task["platform"]):
-                    result = browser_manager.run_async(
-                        submit_application(task["platform"], task["url"], response)
-                    )
-                    if result.get("success"):
-                        add_application(task["platform"], task["url"], response)
-                        log.info(f"Playwright: отклик отправлен на {task['platform']}")
-                    else:
-                        log.warning(f"Playwright: {result.get('message', 'ошибка')}")
-                        # Fallback: just record it
-                        add_application(task["platform"], task["url"], response)
-                else:
-                    log.info(f"Нет cookies для {task['platform']}, записываю отклик без отправки")
+# === Отправка отклика ===
+
+def _do_send(task, response, cid):
+    """Реальная отправка отклика (Playwright или запись)."""
+    log.info(f"Отправка: {task['title'][:40]}")
+
+    # Пытаемся через Playwright
+    if HAS_PLAYWRIGHT:
+        try:
+            from browser import browser_manager, submit_application, cookies_valid
+            if cookies_valid(task["platform"]):
+                result = browser_manager.run_async(
+                    submit_application(task["platform"], task["url"], response)
+                )
+                if result.get("success"):
                     add_application(task["platform"], task["url"], response)
-            except Exception as e:
-                log.error(f"Playwright auto-apply error: {e}")
+                    log.info(f"Playwright: отклик отправлен на {task['platform']}")
+                else:
+                    log.warning(f"Playwright: {result.get('message', 'ошибка')}")
+                    add_application(task["platform"], task["url"], response)
+            else:
+                log.info(f"Нет cookies для {task['platform']}, записываю отклик")
                 add_application(task["platform"], task["url"], response)
-        else:
+        except Exception as e:
+            log.error(f"Playwright error: {e}")
             add_application(task["platform"], task["url"], response)
+    else:
+        add_application(task["platform"], task["url"], response)
 
-        # Помечаем задачу
-        tasks = load_tasks()
-        for t in tasks:
-            if t["url"] == task["url"]:
-                t["applied"] = True
-                t["ai_response"] = response
-                t["status"] = "applied"
-                break
-        save_tasks(tasks)
+    # Помечаем задачу
+    tasks = load_tasks()
+    for t in tasks:
+        if t["url"] == task["url"]:
+            t["applied"] = True
+            t["ai_response"] = response
+            t["status"] = "applied"
+            break
+    save_tasks(tasks)
 
-        cat = CATEGORIES.get(task.get("category", ""), {})
-        emoji = cat.get("emoji", "📋")
-        msg = (
-            f"{emoji} <b>АВТООТПРАВЛЕН</b>\n\n"
-            f"<b>{task['title'][:80]}</b>\n"
-            f"Платформа: {task['platform']}\n"
-            f"Категория: {cat.get('name', '?')}\n\n"
-            f"<a href=\"{task['url']}\">Открыть задачу</a>"
-        )
-        for cid_ in load_chat_ids():
-            answer(cid_, msg)
+    cat = CATEGORIES.get(task.get("category", ""), {})
+    emoji = cat.get("emoji", "📋")
+    msg = (
+        f"{emoji} <b>ОТПРАВЛЕН</b>\n\n"
+        f"<b>{task['title'][:80]}</b>\n"
+        f"Платформа: {task['platform']}\n"
+        f"Категория: {cat.get('name', '?')}\n\n"
+        f"<a href=\"{task['url']}\">Открыть задачу</a>"
+    )
+    for cid_ in load_chat_ids():
+        answer(cid_, msg)
 
 # === Форматирование ===
 
@@ -565,8 +634,16 @@ def fmt_task(task, i):
     score = task.get("ai_score")
     score_str = f" | Score: {score}/100" if score else ""
     applied = " [ОТПРАВЛЕНО]" if task.get("applied") else ""
+    # Индикатор сложности
+    complexity = task.get("ai_complexity", {})
+    if complexity:
+        diff = complexity.get("difficulty", "")
+        diff_emoji = {"easy": "🟢", "medium": "🟡", "hard": "🔴"}.get(diff, "")
+        diff_str = f" {diff_emoji}" if diff else ""
+    else:
+        diff_str = ""
     return (
-        f"{emoji} <b>{i}. {title}</b>\n"
+        f"{emoji} <b>{i}. {title}</b>{diff_str}\n"
         f"{platform} | {cat_name}{score_str}{applied}\n"
         f"<a href=\"{url}\">Открыть задачу</a>"
     )
@@ -589,6 +666,7 @@ def handle_command(cid, text, user):
             "/parse — поиск задач\n"
             "/tasks — задачи\n"
             "/tasks images — задачи по категории\n"
+            "/detail 3 — подробности задачи #3\n"
             "/analyze 3 — AI-анализ\n"
             "/respond 3 — отклик\n"
             "/submit 3 — отправить отклик через браузер\n"
@@ -599,7 +677,8 @@ def handle_command(cid, text, user):
             "/auto — вкл/выкл автоотклик\n"
             "/stats — статистика\n"
             "/accounts — аккаунты\n"
-            "/help — справка")
+            "/help — справка\n\n"
+            "🟢 Изображения (easy) — автоотправка без согласования")
 
     elif cmd == "/help":
         pw_cmds = ""
@@ -616,6 +695,7 @@ def handle_command(cid, text, user):
             "/tasks — все задачи\n"
             "/tasks images — только изображения\n"
             "/tasks development — только разработка\n"
+            "/detail 3 — подробности задачи #3\n"
             "/analyze 3 — AI-анализ задачи #3\n"
             "/respond 3 — сгенерировать отклик\n"
             f"{pw_cmds}"
@@ -625,7 +705,11 @@ def handle_command(cid, text, user):
             "/stats — статистика\n"
             "/accounts — аккаунты\n\n"
             f"Автоотклик: {'ВКЛ' if AUTO_APPLY else 'ВЫКЛ'}\n"
-            f"Лимит авто: {MAX_AUTO_APPLIES}")
+            f"Лимит авто: {MAX_AUTO_APPLIES}\n\n"
+            "Сложность:\n"
+            "🟢 easy — AI может сам (изображения, текст)\n"
+            "🟡 medium — AI с инструментами\n"
+            "🔴 hard — нужен человек/доп. нейросети")
 
     elif cmd == "/parse":
         answer(cid, "Парсинг Fl.ru + Freelancer.com + GitHub...")
@@ -666,6 +750,63 @@ def handle_command(cid, text, user):
         msg = header
         for i, t in enumerate(new_tasks[:20], 1):
             msg += fmt_task(t, i) + "\n\n"
+        answer(cid, msg)
+
+    elif cmd == "/detail":
+        if not args:
+            answer(cid, "Использование: /detail 3\nПоказать подробности задачи #3")
+            return
+        try: num = int(args[0])
+        except: answer(cid, "Число."); return
+        tasks = load_tasks()
+        new_tasks = [t for t in tasks if t.get("status") in ("new", "analyzed")]
+        if num < 1 or num > len(new_tasks):
+            answer(cid, f"#{num} не найден. Доступно: 1-{len(new_tasks)}")
+            return
+        task = new_tasks[num - 1]
+        cat = CATEGORIES.get(task.get("category", ""), {})
+        complexity = task.get("ai_complexity", {})
+
+        # Если оценки сложности нет — делаем её
+        if not complexity:
+            answer(cid, "🔍 Оцениваю сложность задачи...")
+            complexity = assess_complexity(
+                task.get("title", ""),
+                task.get("description", ""),
+                task.get("category", "")
+            )
+            if complexity:
+                # Сохраняем
+                tasks = load_tasks()
+                for t in tasks:
+                    if t["url"] == task["url"]:
+                        t["ai_complexity"] = complexity
+                        break
+                save_tasks(tasks)
+
+        # Формируем подробное сообщение
+        diff = complexity.get("difficulty", "?") if complexity else "?"
+        diff_emoji = {"easy": "🟢 Легко", "medium": "🟡 Средне", "hard": "🔴 Сложно"}.get(diff, f"❓ {diff}")
+        can_do = complexity.get("can_do", "Не оценено") if complexity else "Не оценено"
+        needs_extra = complexity.get("needs_extra", "Не оценено") if complexity else "Не оценено"
+        tools = complexity.get("tools", []) if complexity else []
+        tools_str = ", ".join(tools) if tools else "не определены"
+        est_time = complexity.get("estimated_time", "?") if complexity else "?"
+
+        msg = (
+            f"{cat.get('emoji', '📋')} <b>ПОДРОБНОСТИ ЗАДАЧИ #{num}</b>\n\n"
+            f"<b>{task.get('title', '?')[:100]}</b>\n"
+            f"Платформа: {task.get('platform', '?')}\n"
+            f"Категория: {cat.get('name', '?')}\n\n"
+            f"<b>Сложность:</b> {diff_emoji}\n"
+            f"<b>Время:</b> {est_time}\n\n"
+            f"<b>Что может сделать AI:</b>\n{can_do}\n\n"
+            f"<b>Что нужно дополнительно:</b>\n{needs_extra}\n\n"
+            f"<b>Инструменты:</b> {tools_str}\n\n"
+            f"<a href=\"{task.get('url', '')}\">Открыть задачу</a>\n\n"
+            f"/respond {num} — сгенерировать отклик\n"
+            f"/submit {num} — отправить через браузер"
+        )
         answer(cid, msg)
 
     elif cmd == "/analyze":
