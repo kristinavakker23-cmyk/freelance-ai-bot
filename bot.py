@@ -651,6 +651,7 @@ def fmt_task(task, i):
 # === Команды ===
 
 def handle_command(cid, text, user):
+    global AUTO_APPLY
     cmd = text.split()[0].lower() if text else ""
     args = text.split()[1:] if text else []
     log.info(f"Command {cmd} from chat={cid}")
@@ -1043,7 +1044,6 @@ def handle_command(cid, text, user):
         answer(cid, "\n".join(lines))
 
     elif cmd == "/auto":
-        global AUTO_APPLY
         AUTO_APPLY = not AUTO_APPLY
         answer(cid, f"Автоотклик: {'ВКЛ' if AUTO_APPLY else 'ВЫКЛ'}")
 
